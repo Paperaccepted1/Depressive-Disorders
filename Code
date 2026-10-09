@@ -1,0 +1,245 @@
+# =============================================================================
+# Forecasting the burden of depressive disorders in China and the United States
+# to 2030 using Bayesian age-period-cohort (BAPC) models
+#
+# Manuscript: "Depressive Disorders Burden in China and the United States
+#              From 1990 to 2023" (Acta Neuropsychiatrica)
+#
+# Data source: Global Burden of Disease Study 2023 (GBD 2023), downloaded from
+#              the GBD Results Tool (https://vizhub.healthdata.org/gbd-results/).
+#              Raw GBD data are not redistributed in this repository; see
+#              README for download instructions.
+#
+# Inputs:  data/1_China_USA_region.csv
+#          Age-specific counts (metric = "Number") for incidence, prevalence
+#          and DALYs, 1990-2023, by sex (Male, Female, Both), five-year age
+#          groups from "0 to 4" to "95 plus".
+#
+# Outputs: output/Figure6_Prediction_Results.xlsx
+#          output/TableS_Prediction_2030_formatted.xlsx
+#          output/Prediction_diagnostics.xlsx
+#          output/Figure6_Prediction_Combined.pdf / .tiff
+#          output/sessionInfo.txt
+# =============================================================================
+
+# ---- 0. Packages -------------------------------------------------------------
+library(easyGBDR)
+library(readxl)
+library(writexl)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+# ---- 1. Settings -------------------------------------------------------------
+GBD_edition(edition = 2023)
+
+data_dir   <- "data"
+output_dir <- "output"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+input_file   <- file.path(data_dir, "1_China_USA_region.csv")
+locations    <- c("China", "United States of America")
+pred_year    <- 2030
+last_obs     <- 2023
+pop_forecast <- "WHO"   # "WHO": UN World Population Prospects projections
+                        # "GBD": GBD 2017 population forecasts
+set.seed(2023)
+
+age_groups <- c("0 to 4", "5 to 9", "10 to 14", "15 to 19", "20 to 24",
+                "25 to 29", "30 to 34", "35 to 39", "40 to 44", "45 to 49",
+                "50 to 54", "55 to 59", "60 to 64", "65 to 69", "70 to 74",
+                "75 to 79", "80 to 84", "85 to 89", "90 to 94", "95 plus")
+
+# ---- 2. Load and prepare data ------------------------------------------------
+gbd_data <- read.csv(input_file, header = TRUE, row.names = 1)
+gbd_data <- gbd_data[, -1]                      # drop redundant index column
+gbd_data <- subset(gbd_data, age %in% age_groups)
+
+disease_cause <- unique(gbd_data$cause)[1]
+measures      <- unique(gbd_data$measure)
+
+stopifnot(all(c("Male", "Female", "Both") %in% unique(gbd_data$sex)))
+stopifnot(all(locations %in% unique(gbd_data$location)))
+
+# ---- 3. BAPC projections -----------------------------------------------------
+# Age-specific counts are modelled with BAPC (INLA) using observed GBD 2023
+# population (1990-2023) and projected population (2024-2030). Age-standardised
+# rates use the GBD 2021 world standard population (age groups 0-4 to 95+).
+all_results <- data.frame()
+
+for (current_measure in measures) {
+  bapc_out <- GBDbapc_prediction(
+    data              = gbd_data,
+    measure_name      = current_measure,
+    cause_name        = disease_cause,
+    location_name     = locations,
+    By_sex            = TRUE,
+    predyear          = pred_year,
+    full_age_adjusted = TRUE,
+    pop_predict       = pop_forecast
+  )
+
+  all_age_df <- bapc_out[["all_age_projection"]]
+  asr_df     <- bapc_out[["ASR"]]
+  names(all_age_df)[1:3] <- paste0("all_age_", c("pred_val", "pred_low", "pred_up"))
+  names(asr_df)[1:3]     <- paste0("ASR_",     c("pred_val", "pred_low", "pred_up"))
+
+  merged <- merge(all_age_df, asr_df,
+                  by = c("year", "sex", "measure", "location", "cause"))
+  all_results <- rbind(all_results, merged)
+
+  message("Projection completed: ", current_measure)
+}
+
+write_xlsx(all_results, file.path(output_dir, "Figure6_Prediction_Results.xlsx"))
+
+# ---- 4. Diagnostics ----------------------------------------------------------
+# (a) Flag uncertainty intervals with lower bounds <= 0
+# (b) Check that the both-sex ASR lies between the male and female ASRs
+proj_end <- all_results %>% filter(year == pred_year)
+
+check_bounds <- proj_end %>%
+  transmute(year, location, sex, measure,
+            number_lower_nonpositive = all_age_pred_low <= 0,
+            asr_lower_nonpositive    = ASR_pred_low <= 0)
+
+check_sex <- proj_end %>%
+  select(location, measure, sex, ASR_pred_val) %>%
+  tidyr::pivot_wider(names_from = sex, values_from = ASR_pred_val) %>%
+  mutate(both_within_sex_range =
+           Both >= pmin(Male, Female) & Both <= pmax(Male, Female))
+
+write_xlsx(list(interval_bounds = check_bounds,
+                sex_consistency = check_sex),
+           file.path(output_dir, "Prediction_diagnostics.xlsx"))
+
+if (any(check_bounds$asr_lower_nonpositive | check_bounds$number_lower_nonpositive)) {
+  warning("Some projection intervals have non-positive lower bounds.")
+}
+if (any(!check_sex$both_within_sex_range)) {
+  warning("Both-sex ASR falls outside the male-female range for some strata.")
+}
+
+# ---- 5. Formatted supplementary table ----------------------------------------
+fmt_num <- function(x) format(round(x), big.mark = ",", scientific = FALSE, trim = TRUE)
+fmt_asr <- function(x) sprintf("%.2f", x)
+
+table_2030 <- proj_end %>%
+  mutate(
+    sex     = factor(sex, levels = c("Both", "Female", "Male")),
+    measure = factor(measure, levels = c("Incidence", "Prevalence", "DALYs")),
+    `Predicted number (95% UI)` = paste0(fmt_num(all_age_pred_val), " (",
+                                         fmt_num(all_age_pred_low), " to ",
+                                         fmt_num(all_age_pred_up), ")"),
+    `Predicted ASR per 100,000 (95% UI)` = paste0(fmt_asr(ASR_pred_val), " (",
+                                                  fmt_asr(ASR_pred_low), " to ",
+                                                  fmt_asr(ASR_pred_up), ")")
+  ) %>%
+  arrange(measure, location, sex) %>%
+  select(Year = year, Sex = sex, Measure = measure, Location = location,
+         `Predicted number (95% UI)`, `Predicted ASR per 100,000 (95% UI)`)
+
+write_xlsx(table_2030, file.path(output_dir, "TableS_Prediction_2030_formatted.xlsx"))
+
+# ---- 6. Plotting helpers -----------------------------------------------------
+color_palette <- c(
+  "China_Both"                    = "#D1789D",
+  "China_Male"                    = "#E64B35",
+  "China_Female"                  = "#800080",
+  "United States of America_Both" = "#66C2A5",
+  "United States of America_Male" = "#3498DB",
+  "United States of America_Female" = "#2E8B57"
+)
+
+shape_palette <- c(
+  "China_Both" = 16, "China_Male" = 15, "China_Female" = 17,
+  "United States of America_Both" = 1,
+  "United States of America_Male" = 0,
+  "United States of America_Female" = 2
+)
+
+label_palette <- c(
+  "China_Both" = "China (Both)", "China_Male" = "China (Male)",
+  "China_Female" = "China (Female)",
+  "United States of America_Both" = "USA (Both)",
+  "United States of America_Male" = "USA (Male)",
+  "United States of America_Female" = "USA (Female)"
+)
+
+plot_projection <- function(data, measure_name, type = c("Number", "ASR")) {
+  type <- match.arg(type)
+  val  <- if (type == "Number") "all_age_pred_val" else "ASR_pred_val"
+  low  <- if (type == "Number") "all_age_pred_low" else "ASR_pred_low"
+  up   <- if (type == "Number") "all_age_pred_up"  else "ASR_pred_up"
+
+  data <- data %>% mutate(group = paste(location, sex, sep = "_"))
+  hist_data <- data %>% filter(year <= last_obs)
+  pred_data <- data %>% filter(year >  last_obs)
+
+  p <- ggplot() +
+    geom_ribbon(data = pred_data,
+                aes(x = year, ymin = .data[[low]], ymax = .data[[up]], fill = group),
+                alpha = 0.15) +
+    geom_line(data = hist_data,
+              aes(x = year, y = .data[[val]], color = group), linewidth = 1) +
+    geom_line(data = pred_data,
+              aes(x = year, y = .data[[val]], color = group), linewidth = 1.2) +
+    geom_point(data = pred_data,
+               aes(x = year, y = .data[[val]], color = group, shape = group),
+               size = 2.5) +
+    geom_vline(xintercept = last_obs + 0.5, linetype = "dashed", color = "gray50") +
+    scale_color_manual(values = color_palette, labels = label_palette) +
+    scale_fill_manual(values = color_palette,  labels = label_palette) +
+    scale_shape_manual(values = shape_palette, labels = label_palette) +
+    scale_x_continuous(breaks = seq(1990, pred_year, 5)) +
+    guides(color = guide_legend(nrow = 2),
+           fill  = guide_legend(nrow = 2),
+           shape = guide_legend(nrow = 2)) +
+    theme_bw() +
+    theme(plot.title       = element_text(hjust = 0.5, size = 12, face = "bold"),
+          legend.position  = "bottom",
+          legend.title     = element_blank(),
+          legend.text      = element_text(size = 8),
+          legend.key.size  = unit(0.8, "lines"))
+
+  if (type == "Number") {
+    p + scale_y_continuous(labels = comma) +
+      labs(title = paste0("Number of ", tolower(measure_name), " cases"),
+           x = "Year", y = "Number")
+  } else {
+    p + labs(title = paste0("Age-standardised ", tolower(measure_name), " rate"),
+             x = "Year", y = "Rate per 100,000")
+  }
+}
+
+# ---- 7. Combined figure ------------------------------------------------------
+measure_order <- c("Incidence", "Prevalence", "DALYs")
+plot_list <- list()
+
+for (m in measure_order) {
+  plot_data <- all_results %>% filter(measure == m)
+  if (nrow(plot_data) > 0) {
+    plot_list[[paste0(m, "_Number")]] <- plot_projection(plot_data, m, "Number")
+    plot_list[[paste0(m, "_ASR")]]    <- plot_projection(plot_data, m, "ASR")
+  }
+}
+
+combined_plot <- wrap_plots(plot_list, ncol = 2) +
+  plot_annotation(
+    title = paste0("Projected burden of ", tolower(disease_cause),
+                   " in China and the USA, 1990-", pred_year),
+    theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5)),
+    tag_levels = "A"
+  ) &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+ggsave(file.path(output_dir, "Figure6_Prediction_Combined.pdf"),
+       combined_plot, width = 12, height = 12)
+ggsave(file.path(output_dir, "Figure6_Prediction_Combined.tiff"),
+       combined_plot, width = 12, height = 12, dpi = 300, compression = "lzw")
+
+# ---- 8. Reproducibility record -----------------------------------------------
+writeLines(capture.output(sessionInfo()), file.path(output_dir, "sessionInfo.txt"))
+message("Projection analysis completed.")
